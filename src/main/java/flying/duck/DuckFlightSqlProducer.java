@@ -8,6 +8,7 @@ import org.apache.arrow.flight.*;
 import org.apache.arrow.flight.sql.BasicFlightSqlProducer;
 import org.apache.arrow.flight.sql.impl.FlightSql;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.message.IpcOption;
 import org.apache.arrow.vector.types.MetadataVersion;
@@ -24,6 +25,8 @@ import java.sql.Statement;
 import java.util.Calendar;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static com.google.protobuf.Any.pack;
 import static com.google.protobuf.ByteString.copyFrom;
@@ -42,6 +45,7 @@ public class DuckFlightSqlProducer extends BasicFlightSqlProducer {
     private final ConcurrentHashMap<ByteString, PreparedStatement> preparedStatementCache = new ConcurrentHashMap<>();
     private final Location location;
     private final int batchSize;
+    private final ExecutorService executorService = Executors.newFixedThreadPool(10);
 
     public DuckFlightSqlProducer(String host, int port, RootAllocator allocator, DuckDBConnection backendConn, int batchSize) {
         this.host = host;
@@ -94,27 +98,29 @@ public class DuckFlightSqlProducer extends BasicFlightSqlProducer {
 
     @Override
     public void createPreparedStatement(FlightSql.ActionCreatePreparedStatementRequest request, CallContext context, StreamListener<Result> listener) {
-        try {
-            final ByteString preparedStatementHandle =
-                    copyFrom(request.getQuery().getBytes(StandardCharsets.UTF_8));
-            final PreparedStatement preparedStatement = this.backendConn.prepareStatement(request.getQuery());
-            this.preparedStatementCache.put(preparedStatementHandle, preparedStatement);
+        executorService.submit(() -> {
+            try {
+                final ByteString preparedStatementHandle =
+                        copyFrom(request.getQuery().getBytes(StandardCharsets.UTF_8));
+                final PreparedStatement preparedStatement = this.backendConn.prepareStatement(request.getQuery());
+                this.preparedStatementCache.put(preparedStatementHandle, preparedStatement);
 
-            final ResultSetMetaData metaData = preparedStatement.getMetaData();
-            final FlightSql.ActionCreatePreparedStatementResult result =
-                    FlightSql.ActionCreatePreparedStatementResult.newBuilder()
+                final ResultSetMetaData metaData = preparedStatement.getMetaData();
+                final FlightSql.ActionCreatePreparedStatementResult result =
+                        FlightSql.ActionCreatePreparedStatementResult.newBuilder()
 //                            .setDatasetSchema(
 //                                    copyFrom(serializeMetadata(jdbcToArrowSchema(metaData, DEFAULT_CALENDAR), IPC_OPTION)))
 //                            .setParameterSchema(
 //                                    copyFrom(serializeMetadata(jdbcToArrowSchema(preparedStatement.getParameterMetaData(), DEFAULT_CALENDAR), IPC_OPTION)))
-                            .setPreparedStatementHandle(preparedStatementHandle)
-                            .build();
-            listener.onNext(new Result(pack(result).toByteArray()));
-            listener.onCompleted();
-        } catch (SQLException e) {
-            listener.onError(e);
-            throw CallStatus.INTERNAL.withCause(e).toRuntimeException();
-        }
+                                .setPreparedStatementHandle(preparedStatementHandle)
+                                .build();
+                listener.onNext(new Result(pack(result).toByteArray()));
+                listener.onCompleted();
+            } catch (SQLException e) {
+                listener.onError(e);
+                throw CallStatus.INTERNAL.withCause(e).toRuntimeException();
+            }
+        });
     }
 
     @Override
@@ -138,7 +144,10 @@ public class DuckFlightSqlProducer extends BasicFlightSqlProducer {
 
         try {
             return FlightInfo
-                    .builder(jdbcToArrowSchema(preparedStatement.getMetaData(), DEFAULT_CALENDAR), descriptor, getFlightEndpoints(command))
+                    .builder(jdbcToArrowSchema(preparedStatement.getMetaData(),
+                                    DEFAULT_CALENDAR), descriptor,
+                            List.of(new FlightEndpoint(new Ticket(Any.pack(command).toByteArray())))
+                    )
                     .build();
         } catch (SQLException e) {
             throw CallStatus.INTERNAL.withCause(e).toRuntimeException();
@@ -153,23 +162,27 @@ public class DuckFlightSqlProducer extends BasicFlightSqlProducer {
             throw CallStatus.NOT_FOUND.withDescription("preparedStatement not found").toRuntimeException();
         }
 
-        try {
-            DuckDBResultSet resultSet = (DuckDBResultSet) preparedStatement.executeQuery();
-            ArrowReader arrowReader = (ArrowReader) resultSet.arrowExportStream(this.allocator, this.batchSize);
-            sendArrowStream(arrowReader, listener);
-        } catch (SQLException e) {
-            throw CallStatus.INTERNAL.withCause(e).toRuntimeException();
-        }
+        executorService.submit(() -> {
+            try {
+                DuckDBResultSet resultSet = (DuckDBResultSet) preparedStatement.executeQuery();
+                ArrowReader arrowReader = (ArrowReader) resultSet.arrowExportStream(this.allocator, this.batchSize);
+                sendArrowStream(arrowReader, listener);
+            } catch (SQLException e) {
+                throw CallStatus.INTERNAL.withCause(e).toRuntimeException();
+            }
+        });
     }
 
     private void sendArrowStream(ArrowReader arrowReader, ServerStreamListener listener) {
         try (arrowReader) {
             while (arrowReader.loadNextBatch()) {
-                listener.start(arrowReader.getVectorSchemaRoot());
+                while (!listener.isReady()) Thread.sleep(10);
+                VectorSchemaRoot data = arrowReader.getVectorSchemaRoot();
+                listener.start(data);
                 listener.putNext();
             }
             listener.completed();
-        } catch (IOException e) {
+        } catch (IOException | InterruptedException e) {
             listener.error(e);
             throw CallStatus.INTERNAL.withCause(e).toRuntimeException();
         }
