@@ -175,10 +175,14 @@ public class DuckFlightSqlProducer extends BasicFlightSqlProducer {
 
     private void sendArrowStream(ArrowReader arrowReader, ServerStreamListener listener) {
         try (arrowReader) {
+            boolean started = false;
             while (arrowReader.loadNextBatch()) {
-                while (!listener.isReady()) Thread.sleep(10);
                 VectorSchemaRoot data = arrowReader.getVectorSchemaRoot();
-                listener.start(data);
+                if (!started) {
+                    listener.start(data, arrowReader);
+                    started = true;
+                }
+                while (!listener.isReady()) Thread.sleep(10);
                 listener.putNext();
             }
             listener.completed();

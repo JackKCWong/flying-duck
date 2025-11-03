@@ -12,9 +12,9 @@ class DuckDBFlightServer(flight.FlightServerBase):
     def do_get(self, context, ticket):
         """Handle 'GET' requests from clients to retrieve data."""
         query = ticket.ticket.decode("utf-8")
-        result_table = self.conn.execute(query).fetch_arrow_table()
+        # result_table = self.conn.execute(query).fetch_record_batch(1024)
         # Convert to record batches with alignment
-        batches = result_table.to_batches(max_chunksize=1024)  # Use power of 2 for alignment
+        batches = self.conn.execute(query).fetch_record_batch(1024) # Use power of 2 for alignment
         return flight.RecordBatchStream(pa.Table.from_batches(batches))
 
     def do_put(self, context, descriptor, reader, writer):

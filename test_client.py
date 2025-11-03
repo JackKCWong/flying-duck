@@ -21,6 +21,7 @@ def execute_query(client, query):
     try:
         ticket = flight.Ticket(query.encode("utf-8"))
         reader = client.do_get(ticket)
+        print(type(reader))
         result = reader.read_all()
         return result
     except Exception as e:
@@ -72,4 +73,5 @@ def continuous_query(client):
 if __name__ == "__main__":
     print("Starting continuous query client...")
     client = connect_with_retry()
-    execute_query(client, "select * from ice")
+    rs = execute_query(client, "select * from ice")
+    print(len(rs))
